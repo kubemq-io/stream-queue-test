@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stream-queue
+  namespace: kubemq
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stream-queue
+  template:
+    metadata:
+      labels:
+        app: stream-queue
+    spec:
+      containers:
+        - name: stream-queue
+          image: docker.io/kubemq/stream-queue:latest
+          imagePullPolicy: Always
+          env:
+            - name: ADDRESS
+              value: "kubemq-cluster-grpc"
+            - name: SEND
+              value: "1000"
+            - name: THREADS
+              value: "5"
+            - name: QUEUE
+              value: "q"
+            - name: ROUNDS
+              value: "10"
