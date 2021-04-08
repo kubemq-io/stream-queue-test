@@ -24,7 +24,7 @@ var (
 	_ = pflag.String("queue", "q1", "queue destination")
 	_ = pflag.Int("send", 1000, "total send messages")
 	_ = pflag.Int("threads", 1, "total threads")
-	_ = pflag.Int("rounds", 0, "total rounds")
+	_ = pflag.Int("rounds", 10, "total rounds")
 )
 
 func LoadConfig() (*Config, error) {
@@ -65,7 +65,7 @@ func main() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	sender, err := kubemq.NewClient(ctx,
+	sender, err := kubemq.NewQueuesClient(ctx,
 		kubemq.WithAddress(cfg.Address, 50000),
 		kubemq.WithClientId("stream-queue-sender"),
 		kubemq.WithTransportType(kubemq.TransportTypeGRPC))
@@ -83,11 +83,11 @@ func main() {
 		}
 		for i := 0; i < cfg.Threads; i++ {
 			channel := fmt.Sprintf("%s%d", cfg.Queue, i)
-			batch := sender.NewQueueMessages()
+			var batch []*kubemq.QueueMessage
 			for i := 0; i < cfg.Send; i++ {
-				batch.Add(kubemq.NewQueueMessage().SetChannel(channel).SetBody([]byte("some-stream-simple-queue-message")))
+				batch = append(batch, kubemq.NewQueueMessage().SetChannel(channel).SetBody([]byte("some-stream-simple-queue-message")))
 			}
-			_, err = batch.Send(ctx)
+			_, err = sender.Batch(ctx, batch)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -100,7 +100,7 @@ func main() {
 		for i := 0; i < cfg.Threads; i++ {
 			go func(index int) {
 				defer wg.Done()
-				receiver, err := kubemq.NewClient(ctx,
+				receiver, err := kubemq.NewQueuesClient(ctx,
 					kubemq.WithAddress(cfg.Address, 50000),
 					kubemq.WithClientId(fmt.Sprintf("stream-queue-receiver-%d", index)),
 					kubemq.WithTransportType(kubemq.TransportTypeGRPC))
@@ -110,22 +110,29 @@ func main() {
 				}
 				defer receiver.Close()
 				channel := fmt.Sprintf("%s%d", cfg.Queue, index)
-
-				for i := 0; i < cfg.Send; i++ {
-
-					stream := receiver.NewStreamQueueMessage().SetChannel(channel)
-
-					// get message from the queue
-					msg, err := stream.Next(ctx, 15, 10)
+				cnt := 0
+				done, err := receiver.TransactionStream(ctx, kubemq.NewQueueTransactionMessageRequest().SetChannel(channel).SetVisibilitySeconds(10).SetWaitTimeSeconds(15), func(response *kubemq.QueueTransactionMessageResponse, err error) {
 					if err != nil {
-						log.Fatal(err)
-					}
 
-					err = msg.Ack()
-					if err != nil {
-						log.Fatal(err)
+					} else {
+						err = response.Ack()
+						if err != nil {
+							//log.Fatal(err)
+						}
+						cnt++
 					}
-					stream.Close()
+				})
+				if err != nil {
+					return
+				}
+				for {
+					select {
+					case <-time.After(1 * time.Millisecond):
+						if cnt >= cfg.Send {
+							done <- struct{}{}
+							return
+						}
+					}
 				}
 			}(i)
 		}
