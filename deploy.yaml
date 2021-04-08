@@ -23,7 +23,7 @@ spec:
             - name: SEND
               value: "1000"
             - name: THREADS
-              value: "5"
+              value: "1"
             - name: QUEUE
               value: "q"
             - name: ROUNDS
