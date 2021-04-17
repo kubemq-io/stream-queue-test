@@ -6,17 +6,21 @@ import (
 	"github.com/kubemq-io/kubemq-go"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	"go.uber.org/atomic"
 	"log"
+	"math/rand"
 	"sync"
 	"time"
 )
 
 type Config struct {
-	Address string
-	Queue   string
-	Send    int
-	Threads int
-	Rounds  int
+	Address   string
+	Queue     string
+	Send      int
+	Threads   int
+	Rounds    int
+	AckDelay  int
+	Receivers int
 }
 
 var (
@@ -24,7 +28,9 @@ var (
 	_ = pflag.String("queue", "q1", "queue destination")
 	_ = pflag.Int("send", 1000, "total send messages")
 	_ = pflag.Int("threads", 1, "total threads")
-	_ = pflag.Int("rounds", 10, "total rounds")
+	_ = pflag.Int("rounds", 0, "total rounds")
+	_ = pflag.Int("ack_delay", 10, "ack delay in seconds")
+	_ = pflag.Int("receivers", 1, "num of receivers for each threads")
 )
 
 func LoadConfig() (*Config, error) {
@@ -37,12 +43,16 @@ func LoadConfig() (*Config, error) {
 	_ = viper.BindEnv("Threads", "THREADS")
 	_ = viper.BindEnv("Queue", "QUEUE")
 	_ = viper.BindEnv("Rounds", "ROUNDS")
+	_ = viper.BindEnv("AckDelay", "ACK_DELAY")
+	_ = viper.BindEnv("Receivers", "RECEIVERS")
 
 	_ = viper.BindPFlag("Address", pflag.CommandLine.Lookup("address"))
 	_ = viper.BindPFlag("Queue", pflag.CommandLine.Lookup("queue"))
 	_ = viper.BindPFlag("Send", pflag.CommandLine.Lookup("send"))
 	_ = viper.BindPFlag("Threads", pflag.CommandLine.Lookup("threads"))
 	_ = viper.BindPFlag("Rounds", pflag.CommandLine.Lookup("rounds"))
+	_ = viper.BindPFlag("AckDelay", pflag.CommandLine.Lookup("ack_delay"))
+	_ = viper.BindPFlag("Receivers", pflag.CommandLine.Lookup("receivers"))
 
 	err := viper.Unmarshal(cfg)
 	if err != nil {
@@ -60,6 +70,7 @@ func getFloatAvg(list []float64) float64 {
 }
 func main() {
 	cfg, err := LoadConfig()
+	rand.Seed(time.Now().UnixNano())
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -85,7 +96,8 @@ func main() {
 			channel := fmt.Sprintf("%s%d", cfg.Queue, i)
 			var batch []*kubemq.QueueMessage
 			for i := 0; i < cfg.Send; i++ {
-				batch = append(batch, kubemq.NewQueueMessage().SetChannel(channel).SetBody([]byte("some-stream-simple-queue-message")))
+				batch = append(batch, kubemq.NewQueueMessage().
+					SetChannel(channel).SetBody([]byte("some-stream-simple-queue-message")))
 			}
 			_, err = sender.Batch(ctx, batch)
 			if err != nil {
@@ -100,36 +112,50 @@ func main() {
 		for i := 0; i < cfg.Threads; i++ {
 			go func(index int) {
 				defer wg.Done()
+				cnt := atomic.NewInt32(0)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
 				receiver, err := kubemq.NewQueuesClient(ctx,
 					kubemq.WithAddress(cfg.Address, 50000),
 					kubemq.WithClientId(fmt.Sprintf("stream-queue-receiver-%d", index)),
+					kubemq.WithAutoReconnect(true),
 					kubemq.WithTransportType(kubemq.TransportTypeGRPC))
 				if err != nil {
 					log.Fatal(err)
 
 				}
 				defer receiver.Close()
-				channel := fmt.Sprintf("%s%d", cfg.Queue, index)
-				cnt := 0
-				done, err := receiver.TransactionStream(ctx, kubemq.NewQueueTransactionMessageRequest().SetChannel(channel).SetVisibilitySeconds(10).SetWaitTimeSeconds(15), func(response *kubemq.QueueTransactionMessageResponse, err error) {
-					if err != nil {
+				for i := 0; i < cfg.Receivers; i++ {
+					go func(ctx context.Context, index int) {
+						channel := fmt.Sprintf("%s%d", cfg.Queue, index)
+						done, err := receiver.TransactionStream(ctx, kubemq.NewQueueTransactionMessageRequest().SetChannel(channel).SetVisibilitySeconds(10).SetWaitTimeSeconds(15), func(response *kubemq.QueueTransactionMessageResponse, err error) {
+							if err != nil {
 
-					} else {
-						err = response.Ack()
+							} else {
+								cnt.Inc()
+								//log.Println (fmt.Sprintf("queue: %s, message seq %d received",response.Message.Channel,response.Message.Attributes.Sequence))
+								//t:=rand.Intn(1200-200+1) + 200
+								//time.Sleep(time.Duration(t)  *time.Millisecond)
+								time.Sleep(time.Duration(cfg.AckDelay) * time.Millisecond)
+								err = response.Ack()
+								if err != nil {
+									//log.Fatal(err)
+								}
+
+							}
+						})
 						if err != nil {
-							//log.Fatal(err)
+							return
 						}
-						cnt++
-					}
-				})
-				if err != nil {
-					return
+						<-ctx.Done()
+						done <- struct{}{}
+					}(ctx, index)
 				}
+
 				for {
 					select {
 					case <-time.After(1 * time.Millisecond):
-						if cnt >= cfg.Send {
-							done <- struct{}{}
+						if cnt.Load() >= int32(cfg.Send) {
 							return
 						}
 					}
