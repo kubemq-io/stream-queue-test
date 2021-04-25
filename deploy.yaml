@@ -21,14 +21,14 @@ spec:
             - name: ADDRESS
               value: "kubemq-cluster-grpc"
             - name: SEND
-              value: "100"
+              value: "10000"
             - name: THREADS
-              value: "20"
+              value: "10"
             - name: QUEUE
-              value: "w"
+              value: "tt"
             - name: ROUNDS
               value: "0"
             - name: ACK_DELAY
-              value: "10"
+              value: "0"
             - name: RECEIVERS
               value: "1"
