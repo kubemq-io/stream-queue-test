@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/kubemq-io/kubemq-go"
+	"github.com/kubemq-io/kubemq-go/clients"
+
+	"github.com/kubemq-io/kubemq-go/clients/queues"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"go.uber.org/atomic"
@@ -25,8 +27,8 @@ type Config struct {
 var (
 	_ = pflag.String("address", "localhost", "kubemq-address")
 	_ = pflag.String("queue", "d", "queue destination")
-	_ = pflag.Int("send", 1000, "total send messages")
-	_ = pflag.Int("threads", 10, "total threads")
+	_ = pflag.Int("send", 3000, "total send messages")
+	_ = pflag.Int("threads", 150, "total threads")
 	_ = pflag.Int("rounds", 0, "total rounds")
 	_ = pflag.Int("ack_delay", 0, "ack delay in seconds")
 )
@@ -64,11 +66,11 @@ func getFloatAvg(list []float64) float64 {
 	}
 	return cnt / float64(len(list))
 }
-func getClient(ctx context.Context, host string, port int) *kubemq.QueuesClient {
-	c, _ := kubemq.NewQueuesClient(ctx,
-		kubemq.WithAddress(host, port),
-		kubemq.WithClientId("stream-queue-sender"),
-		kubemq.WithTransportType(kubemq.TransportTypeGRPC))
+func getClient(ctx context.Context, host string, port int) *queues.QueuesClient {
+	c, _ := queues.NewQueuesClient(ctx,
+		clients.WithAddress(host, port),
+		clients.WithClientId("stream-queue-sender"))
+
 	return c
 }
 func main() {
@@ -79,17 +81,9 @@ func main() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var senders []*kubemq.QueuesClient
-	senders = append(senders,
-		getClient(ctx, cfg.Address, 50000),
-		getClient(ctx, cfg.Address, 50000),
-		getClient(ctx, cfg.Address, 50000),
-	)
-
+	sender := getClient(ctx, cfg.Address, 50000)
 	defer func() {
-		for i := 0; i < len(senders); i++ {
-			_ = senders[i].Close()
-		}
+		_ = sender.Close()
 	}()
 	var roundList []float64
 	cnt := 0
@@ -100,18 +94,18 @@ func main() {
 		}
 		for i := 0; i < cfg.Threads; i++ {
 			channel := fmt.Sprintf("%s%d", cfg.Queue, i)
-			var batch []*kubemq.QueueMessage
+			var batch []*queues.QueueMessage
 			for i := 0; i < cfg.Send; i++ {
-				batch = append(batch, kubemq.NewQueueMessage().
+				batch = append(batch, queues.NewQueueMessage().
 					SetChannel(channel).SetBody([]byte("some-stream-simple-queue-message")))
 			}
-			_, err = senders[i%len(senders)].Batch(ctx, batch)
+			_, err = sender.Send(ctx, batch...)
 			if err != nil {
-				log.Fatal(err)
+				log.Println(err)
 			}
-			log.Printf(fmt.Sprintf("%d messages sent to queue %s", cfg.Send, channel))
-		}
 
+		}
+		log.Printf(fmt.Sprintf("%d messages sent to queues", cfg.Threads*cfg.Send))
 		startAll := time.Now().UnixNano()
 		wg := sync.WaitGroup{}
 		wg.Add(cfg.Threads)
@@ -119,65 +113,23 @@ func main() {
 			go func(index int) {
 				defer wg.Done()
 				cnt := atomic.NewInt32(0)
-				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
-
-				receiver, err := kubemq.NewQueuesClient(ctx,
-					kubemq.WithAddress(cfg.Address, 50000),
-					kubemq.WithClientId(fmt.Sprintf("stream-queue-receiver-%d", index)),
-					kubemq.WithAutoReconnect(true),
-					kubemq.WithTransportType(kubemq.TransportTypeGRPC))
-				if err != nil {
-					log.Fatal(err)
-
-				}
-				defer receiver.Close()
 				channel := fmt.Sprintf("%s%d", cfg.Queue, index)
-				done, err := receiver.TransactionStream(ctx, kubemq.NewQueueTransactionMessageRequest().SetChannel(channel).SetVisibilitySeconds(10).SetWaitTimeSeconds(15), func(response *kubemq.QueueTransactionMessageResponse, err error) {
-					if err != nil {
-
-					} else {
-						cnt.Inc()
-						//log.Println (fmt.Sprintf("queue: %s, message seq %d received",response.Message.Channel,response.Message.Attributes.Sequence))
-						//t:=rand.Intn(1200-200+1) + 200
-						//time.Sleep(time.Duration(t)  *time.Millisecond)
-						time.Sleep(time.Duration(cfg.AckDelay) * time.Millisecond)
-						err = response.Ack()
-						if err != nil {
-							//log.Fatal(err)
-						}
-
-					}
-				})
-
-				//localctx, localCancel := context.WithCancel(ctx)
-				//for i := 0; i < 10; i++ {
-				//	go func() {
-				//		done, err := receiver.Subscribe(localctx, kubemq.NewReceiveQueueMessagesRequest().SetChannel(channel).SetMaxNumberOfMessages(cfg.Send/10).SetWaitTimeSeconds(60), func(response *kubemq.ReceiveQueueMessagesResponse, err error) {
-				//			if err != nil {
-				//
-				//			} else {
-				//				cnt.Add(response.MessagesReceived)
-				//			}
-				//		})
-				//		if err != nil {
-				//			return
-				//		}
-				//		<-localctx.Done()
-				//		done <- struct{}{}
-				//	}()
-				//
-				//}
-
-				for {
-					select {
-					case <-time.After(1 * time.Millisecond):
-						if cnt.Load() >= int32(cfg.Send) {
-							done <- struct{}{}
-							return
-						}
-					}
+				response, err := sender.Poll(ctx, queues.NewPollRequest().
+					SetChannel(channel).
+					SetMaxItems(cfg.Send).
+					SetAutoAck(false).
+					SetWaitTimeout(10000).SetOnErrorFunc(func(err error) {
+					log.Println(err)
+				}))
+				if err != nil {
+					log.Println(err)
+					return
 				}
+				if err := response.AckAll(); err != nil {
+					log.Println(err)
+					return
+				}
+				cnt.Add(int32(len(response.Messages)))
 			}(i)
 		}
 		wg.Wait()

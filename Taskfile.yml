@@ -4,7 +4,7 @@ version: '3'
 
 vars:
   BINARY_NAME: stream-queue
-  VERSION: v0.0.4
+  VERSION: v0.1.0
 
 tasks:
   docker:
@@ -16,6 +16,10 @@ tasks:
       -  go mod vendor
       -  docker build --build-arg VERSION={{.VERSION}} . -t kubemq/{{.BINARY_NAME}}:{{.VERSION}}
       -  docker tag kubemq/{{.BINARY_NAME}}:{{.VERSION}} kubemq/{{.BINARY_NAME}}:latest
+  default:
+    cmds:
+      - go build -o "{{.BINARY_NAME}}.exe"
+      - stream-queue.exe
   push:
     cmds:
       - docker push kubemq/{{.BINARY_NAME}}:{{.VERSION}}

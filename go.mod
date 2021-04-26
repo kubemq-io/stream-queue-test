@@ -8,3 +8,8 @@ require (
 	github.com/spf13/viper v1.7.1
 	go.uber.org/atomic v1.6.0
 )
+
+replace (
+	github.com/kubemq-io/kubemq-go => ../kubemq-go
+	github.com/kubemq-io/protobuf => ../protobuf
+)
